@@ -1,10 +1,8 @@
 import pandas as pd
 from pathlib import Path
 
-# Caminho genérico para a raiz do projeto (onde está o script)
 project_root = Path(__file__).resolve().parent
 
-# Caminho para o CSV (relativo à raiz do projeto)
 csv_path = project_root / "trainLabels.csv"
 
 df = pd.read_csv(csv_path)
