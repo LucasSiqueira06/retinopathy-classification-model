@@ -1,182 +1,190 @@
+import os
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from PIL import Image
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, mean_squared_error
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.models import Sequential, Model
-from tensorflow.keras.layers import (
-    Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization, Input, GlobalAveragePooling2D
-)
-from tensorflow.keras.applications import MobileNetV2
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.preprocessing import label_binarize
+import torch
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision import transforms
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torcheval.metrics.functional import multiclass_f1_score
 
-# 📁 Caminhos
+# === CONFIGURAÇÕES ===
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE = 32
+EPOCHS = 15
+IMG_SIZE = (224, 224)
+NUM_CLASSES = 5
+SEED = 42
+
+torch.manual_seed(SEED)
+
 project_root = Path(__file__).resolve().parent
 image_dir = project_root / "resized_train"
 train_csv = project_root / "train_split.csv"
 test_csv = project_root / "test_split.csv"
 
-# ⚙️ Parâmetros
-IMG_SIZE = (224, 224)
-BATCH_SIZE = 32
-EPOCHS = 10
+# === TRANSFORMS ===
+train_transform = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
 
-# 📄 Carregar os CSVs
-train_df = pd.read_csv(train_csv)
-test_df = pd.read_csv(test_csv)
+test_transform = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
 
-for df in [train_df, test_df]:
-    df['filename'] = df['image'] + ".jpeg"
-    df['class'] = df['level'].astype(str)
+# === DATASET PERSONALIZADO ===
+class RetinaDataset(Dataset):
+    def __init__(self, csv_path, image_dir, transform=None):
+        self.df = pd.read_csv(csv_path)
+        self.df['filename'] = self.df['image'] + ".jpeg"
+        self.image_dir = image_dir
+        self.transform = transform
 
-# 🔄 Data Augmentation para treino
-train_datagen = ImageDataGenerator(
-    rescale=1./255,
-    validation_split=0.1,
-    rotation_range=20,
-    zoom_range=0.15,
-    width_shift_range=0.1,
-    height_shift_range=0.1,
-    horizontal_flip=True,
-    fill_mode="nearest"
-)
+    def __len__(self):
+        return len(self.df)
 
-test_datagen = ImageDataGenerator(rescale=1./255, validation_split=0.1)
+    def __getitem__(self, idx):
+        img_path = self.image_dir / self.df.iloc[idx]['filename']
+        image = Image.open(img_path).convert('RGB')
+        label = int(self.df.iloc[idx]['level'])
+        if self.transform:
+            image = self.transform(image)
+        return image, label
 
-# 🔀 Geradores
-train_gen = train_datagen.flow_from_dataframe(
-    dataframe=train_df,
-    directory=image_dir,
-    x_col='filename',
-    y_col='class',
-    target_size=IMG_SIZE,
-    batch_size=BATCH_SIZE,
-    class_mode='categorical',
-    subset='training',
-    shuffle=True
-)
+# === MODELO CNN DO ZERO ===
+class SimpleCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.drop = nn.Dropout(0.5)
+        self.fc1 = nn.Linear(128 * 28 * 28, 128)
+        self.fc2 = nn.Linear(128, NUM_CLASSES)
 
-val_gen = test_datagen.flow_from_dataframe(
-    dataframe=train_df,
-    directory=image_dir,
-    x_col='filename',
-    y_col='class',
-    target_size=IMG_SIZE,
-    batch_size=BATCH_SIZE,
-    class_mode='categorical',
-    subset='validation',
-    shuffle=False
-)
+    def forward(self, x):
+        x = self.pool(F.relu(self.conv1(x)))   # (B, 32, 112, 112)
+        x = self.pool(F.relu(self.conv2(x)))   # (B, 64, 56, 56)
+        x = self.pool(F.relu(self.conv3(x)))   # (B, 128, 28, 28)
+        x = x.view(-1, 128 * 28 * 28)
+        x = self.drop(F.relu(self.fc1(x)))
+        x = self.fc2(x)
+        return x
 
-test_gen = test_datagen.flow_from_dataframe(
-    dataframe=test_df,
-    directory=image_dir,
-    x_col='filename',
-    y_col='class',
-    target_size=IMG_SIZE,
-    batch_size=BATCH_SIZE,
-    class_mode='categorical',
-    shuffle=False
-)
+# === FUNÇÃO DE TREINAMENTO ===
+def train_model(model, train_loader, val_loader, optimizer, criterion):
+    model.train()
+    train_losses, val_losses, accs = [], [], []
 
-# =========================
-# MODELO 1: CNN DO ZERO
-# =========================
-def build_custom_cnn():
-    model = Sequential([
-        Input(shape=(224, 224, 3)),
-        Conv2D(32, (3, 3), activation='relu', padding='same'),
-        MaxPooling2D((2, 2)),
-        BatchNormalization(),
+    for epoch in range(EPOCHS):
+        total_loss = 0
+        for images, labels in train_loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
 
-        Conv2D(64, (3, 3), activation='relu', padding='same'),
-        MaxPooling2D((2, 2)),
-        BatchNormalization(),
+        train_losses.append(total_loss / len(train_loader))
 
-        Conv2D(128, (3, 3), activation='relu', padding='same'),
-        MaxPooling2D((2, 2)),
-        BatchNormalization(),
+        # Validação
+        model.eval()
+        correct, total = 0, 0
+        val_loss = 0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(DEVICE), labels.to(DEVICE)
+                outputs = model(images)
+                val_loss += criterion(outputs, labels).item()
+                preds = outputs.argmax(dim=1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
 
-        Flatten(),
-        Dense(128, activation='relu'),
-        Dropout(0.5),
-        Dense(5, activation='softmax')
-    ])
-    model.compile(optimizer=Adam(1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
-    return model
+        val_losses.append(val_loss / len(val_loader))
+        accs.append(correct / total)
 
-print("\n🔧 Treinando CNN personalizada do zero...\n")
-custom_model = build_custom_cnn()
-custom_history = custom_model.fit(train_gen, validation_data=val_gen, epochs=EPOCHS, callbacks=[EarlyStopping(patience=3, restore_best_weights=True)])
+        print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {train_losses[-1]:.4f} | Val Loss: {val_losses[-1]:.4f} | Val Acc: {accs[-1]:.4f}")
 
-# =========================
-# MODELO 2: TRANSFER LEARNING (MobileNetV2)
-# =========================
-def build_mobilenet():
-    base_model = MobileNetV2(input_shape=(224, 224, 3), include_top=False, weights='imagenet')
-    x = base_model.output
-    x = GlobalAveragePooling2D()(x)
-    x = Dense(128, activation='relu')(x)
-    x = Dropout(0.5)(x)
-    predictions = Dense(5, activation='softmax')(x)
-    model = Model(inputs=base_model.input, outputs=predictions)
+    return train_losses, val_losses, accs
 
-    for layer in base_model.layers[:-40]:
-        layer.trainable = False
+# === PREPARAÇÃO DOS DADOS ===
+train_dataset = RetinaDataset(train_csv, image_dir, transform=train_transform)
+test_dataset = RetinaDataset(test_csv, image_dir, transform=test_transform)
 
-    model.compile(optimizer=Adam(1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
-    return model
+# Split treino/validação
+val_size = int(0.1 * len(train_dataset))
+train_size = len(train_dataset) - val_size
+train_set, val_set = random_split(train_dataset, [train_size, val_size])
 
-print("\n🔧 Treinando MobileNetV2 (Transfer Learning)...\n")
-mobilenet_model = build_mobilenet()
-mobilenet_history = mobilenet_model.fit(train_gen, validation_data=val_gen, epochs=EPOCHS, callbacks=[EarlyStopping(patience=3, restore_best_weights=True)])
+train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-# =========================
-# AVALIAÇÃO
-# =========================
-def evaluate_model(model, name):
-    print(f"\n📊 Avaliação do modelo: {name}")
-    y_true = test_gen.classes
-    y_pred_prob = model.predict(test_gen)
-    y_pred = np.argmax(y_pred_prob, axis=1)
+# === TREINAMENTO ===
+model = SimpleCNN().to(DEVICE)
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
+criterion = nn.CrossEntropyLoss()
 
-    print("Classification Report:\n", classification_report(y_true, y_pred))
-    print("Confusion Matrix:\n", confusion_matrix(y_true, y_pred))
-    print("MSE:", mean_squared_error(y_true, y_pred))
-    print("ROC AUC:", roc_auc_score(test_gen.labels, y_pred_prob, multi_class='ovr'))
+print("\n🔧 Iniciando treinamento...\n")
+train_losses, val_losses, accs = train_model(model, train_loader, val_loader, optimizer, criterion)
 
-    return y_true, y_pred, y_pred_prob
+# === AVALIAÇÃO ===
+model.eval()
+y_true, y_pred, y_probs = [], [], []
 
-# Avaliar os dois modelos
-evaluate_model(custom_model, "CNN Personalizada")
-evaluate_model(mobilenet_model, "MobileNetV2 (Transfer Learning)")
+with torch.no_grad():
+    for images, labels in test_loader:
+        images = images.to(DEVICE)
+        outputs = model(images)
+        probs = F.softmax(outputs, dim=1).cpu().numpy()
+        preds = outputs.argmax(dim=1).cpu().numpy()
+        y_probs.extend(probs)
+        y_pred.extend(preds)
+        y_true.extend(labels.numpy())
 
-# =========================
-# GRÁFICOS DE TREINAMENTO
-# =========================
-def plot_history(hist, title):
-    plt.figure(figsize=(12, 4))
+y_true = np.array(y_true)
+y_pred = np.array(y_pred)
+y_probs = np.array(y_probs)
+y_true_bin = label_binarize(y_true, classes=list(range(NUM_CLASSES)))
 
-    plt.subplot(1, 2, 1)
-    plt.plot(hist.history['accuracy'], label='Train Acc')
-    plt.plot(hist.history['val_accuracy'], label='Val Acc')
-    plt.title(f'Acurácia - {title}')
-    plt.xlabel('Épocas')
-    plt.ylabel('Acurácia')
-    plt.legend()
+# === MÉTRICAS ===
+print("\n📊 Classification Report:")
+print(classification_report(y_true, y_pred))
 
-    plt.subplot(1, 2, 2)
-    plt.plot(hist.history['loss'], label='Train Loss')
-    plt.plot(hist.history['val_loss'], label='Val Loss')
-    plt.title(f'Perda - {title}')
-    plt.xlabel('Épocas')
-    plt.ylabel('Loss')
-    plt.legend()
+print("📉 Confusion Matrix:")
+print(confusion_matrix(y_true, y_pred))
 
-    plt.tight_layout()
-    plt.show()
+print("📈 F1-score (macro):", multiclass_f1_score(torch.tensor(y_pred), torch.tensor(y_true), num_classes=NUM_CLASSES, average='macro').item())
+print("📈 MSE:", mean_squared_error(y_true, y_pred))
+print("📈 ROC AUC:", roc_auc_score(y_true_bin, y_probs, multi_class='ovr'))
 
-plot_history(custom_history, 'CNN Personalizada')
-plot_history(mobilenet_history, 'MobileNetV2')
+# === GRÁFICOS ===
+plt.plot(train_losses, label="Train Loss")
+plt.plot(val_losses, label="Val Loss")
+plt.title("Loss por Época")
+plt.xlabel("Época")
+plt.ylabel("Loss")
+plt.legend()
+plt.show()
+
+plt.plot(accs, label="Val Accuracy")
+plt.title("Validação - Acurácia por Época")
+plt.xlabel("Época")
+plt.ylabel("Acurácia")
+plt.legend()
+plt.show()
